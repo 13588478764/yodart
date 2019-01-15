@@ -1,8 +1,7 @@
 {
   "PROFILE": {
     "BLE": "BLE", 
-    "A2DP": "A2DP",
-    "HFP": "HFP"
+    "A2DP": "A2DP"
   },
 
   "A2DP_MODE": {
@@ -34,12 +33,5 @@
     "ON": "ON_DISCOVERABLE",
     "OFF": "ON_UNDISCOVERABLE",
     "DEVICE_LIST_CHANGED": "ON_DEVICE_LIST_CHANGE"
-  },
-
-  "CALL_STATE": {
-    "IDLE": "IDLE",
-    "INCOMING": "INCOMING",
-    "OFFHOOK": "OFFHOOK",
-    "RING": "RING"
   }
 }

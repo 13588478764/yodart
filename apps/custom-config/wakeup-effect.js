@@ -110,7 +110,6 @@ function downloadWav (wakeupSoundEffects, path) {
 
 /**
  * Wakeup effect processor
- * @extends BaseConfig
  */
 class WakeupEffect extends BaseConfig {
   constructor (activity) {
@@ -244,10 +243,10 @@ class WakeupEffect extends BaseConfig {
   }
   /**
    * process request from url
-   * @param {object} queryObj - object from url,
+   * @param {string} queryObj - object from url,
    */
   onWakeupEffectStatusChangedFromUrl (queryObj) {
-    if (typeof queryObj === 'object' && typeof queryObj.param === 'string') {
+    if (queryObj && queryObj.param) {
       var realQueryObj = safeParse(queryObj.param)
       this.applyWakeupEffect(realQueryObj, queryObj.isFirstLoad)
     }
@@ -289,7 +288,7 @@ class WakeupEffect extends BaseConfig {
 
       if (!isFirstLoad) {
         if (queryObj.action === SWITCH_OPEN) {
-          if (typeof queryObj.type === 'string' && queryObj.type === AWAKE_EFFECT_CUSTOM) {
+          if (queryObj.type && queryObj.type === AWAKE_EFFECT_CUSTOM) {
             this.activity.tts.speak(WAKE_SOUND_OPEN_CUSTOM).then(() => this.activity.exit())
           } else {
             this.activity.tts.speak(WAKE_SOUND_OPEN_DEFAULT).then(() => this.activity.exit())
