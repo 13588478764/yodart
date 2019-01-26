@@ -542,7 +542,7 @@ AppRuntime.prototype.dispatchNotification = function dispatchNotification (chann
     }
     var appId = appIds[idx]
     var future = Promise.resolve()
-    if (filterOption !== 'all') {
+    if (filterOption === 'all') {
       future = self.component.lifetime.createApp(appId)
         /** force quit app on create error */
         .catch(err => {
@@ -602,11 +602,14 @@ AppRuntime.prototype.setMicMute = function setMicMute (mute, options) {
   }
 
   return future
-    .then(() => this.component.light.play(
-      '@yoda',
-      'system://setMuted.js',
-      { muted: muted },
-      { shouldResume: muted }))
+    .then(() => {
+      var noTts = !!this.component.lifetime.getCurrentAppId()
+      this.component.light.play(
+        '@yoda',
+        'system://setMuted.js',
+        { muted: muted, noTts: noTts },
+        { shouldResume: muted })
+    })
 }
 
 /**
