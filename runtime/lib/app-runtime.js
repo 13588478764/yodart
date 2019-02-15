@@ -16,6 +16,7 @@ var logger = require('logger')('yoda')
 var ComponentConfig = require('/etc/yoda/component-config.json')
 
 var _ = require('@yoda/util')._
+var deprecate = require('@yoda/util/deprecate')
 var wifi = require('@yoda/wifi')
 var property = require('@yoda/property')
 var system = require('@yoda/system')
@@ -34,9 +35,8 @@ perf.stub('init')
  */
 function AppRuntime () {
   EventEmitter.call(this)
-  this.config = {
-    host: env.cloudgw.wss,
-    port: 443,
+  this.credential = {
+    masterId: null,
     deviceId: null,
     deviceTypeId: null,
     key: null,
@@ -61,7 +61,7 @@ function AppRuntime () {
 
   this.inited = false
   this.hibernated = false
-  this.welcoming = false
+  this.__temporaryDisablingReasons = [ 'initiating' ]
   // identify load app complete
   this.loadAppComplete = false
   this.shouldStopLongPressMicLight = false
@@ -77,52 +77,85 @@ AppRuntime.prototype.init = function init () {
   if (this.inited) {
     return Promise.resolve()
   }
+  /** 1. init components. */
   this.componentsInvoke('init')
+  /** 2. init device properties, such as volume and cloud stack. */
   this.initiate()
-  /** set turen to not muted */
+  this.resetCloudStack()
+  /** 3. init services */
   this.component.turen.toggleMute(false)
   this.component.turen.toggleWakeUpEngine(true)
+  this.resetServices()
 
+  /** 4. listen on lifetime events */
   this.component.lifetime.on('stack-reset', () => {
     this.resetCloudStack()
   })
   this.component.lifetime.on('preemption', appId => {
     this.appPause(appId)
   })
-  // initializing the whole process...
-  this.resetCloudStack()
-  this.resetServices()
-  this.shouldWelcome = !this.isStartupFlagExists()
 
+  /** 5. determines if welcome announcements are needed */
+  this.shouldWelcome = !this.isStartupFlagExists()
+  var isFirstBoot = property.get('sys.firstboot.init', 'persist') !== '1'
+  property.set('sys.firstboot.init', '1', 'persist')
+
+  var shouldBreakInit = () => {
+    if (this.hasBeenDisabled()) {
+      if (this.__temporaryDisablingReasons.length > 1) {
+        return true
+      }
+      if (this.__temporaryDisablingReasons[0] !== 'welcoming') {
+        return true
+      }
+    }
+    return false
+  }
+
+  /** 6. load app manifests */
   return this.loadApps().then(() => {
     this.inited = true
+    this.enableRuntimeFor('initiating')
+
+    /** 7. questioning if any interests of delegation */
     return this.component.dispatcher.delegate('runtimeDidInit')
   }).then(delegation => {
     if (delegation) {
       return
     }
-    this.welcoming = true
+    this.disableRuntimeFor('welcoming')
 
+    /** 8. announce welcoming */
     var future = Promise.resolve()
-    if (property.get('sys.firstboot.init', 'persist') !== '1') {
-      // initializing play tts status
-      property.set('sys.firstboot.init', '1', 'persist')
+    if (isFirstBoot) {
+      /** 8.1. announce first time welcoming */
       future = future.then(() => {
-        return this.component.light.ttsSound('@system', 'system://firstboot.ogg')
+        if (shouldBreakInit()) {
+          return
+        }
+        return this.component.light.ttsSound('@yoda', 'system://firstboot.ogg')
       })
     }
     if (this.shouldWelcome) {
+      /** 8.2. announce system loading */
       future = future.then(() => {
+        if (shouldBreakInit()) {
+          return
+        }
         this.component.light.play('@yoda', 'system://boot.js', { fps: 200 })
         return this.component.light.appSound('@yoda', 'system://boot.ogg')
       })
     }
     return future.then(() => {
-      this.welcoming = false
+      this.enableRuntimeFor('welcoming')
+      if (shouldBreakInit()) {
+        return
+      }
+      /** 9. force-enable and check network states */
       this.component.custodian.prepareNetwork()
     }).catch(err => {
       logger.error('unexpected error on boot welcoming', err.stack)
-      this.welcoming = false
+      this.enableRuntimeFor('welcoming')
     })
   })
 }
@@ -260,6 +293,76 @@ AppRuntime.prototype.handlePowerActivation = function handlePowerActivation () {
 }
 
 /**
+ * Determines if runtime has been disabled for specific reason or just has been disabled.
+ *
+ * @param {string} [reason]
+ * @returns {boolean}
+ */
+AppRuntime.prototype.hasBeenDisabled = function hasBeenDisabled (reason) {
+  if (reason) {
+    return this.__temporaryDisablingReasons.indexOf(reason) >= 0
+  }
+  return this.__temporaryDisablingReasons.length > 0
+}
+
+/**
+ * Get all reasons for disabling runtime.
+ *
+ * @returns {string[]}
+ */
+AppRuntime.prototype.getDisabledReasons = function getDisabledReasons () {
+  return this.__temporaryDisablingReasons
+}
+
+/**
+ * Disable runtime for reason.
+ *
+ * Effects:
+ * - Turen wake up engine would be disabled.
+ * - Network events would be ignored.
+ * - Battery events would be ignored.
+ * - Application could not be opened through dispatching.
+ *
+ * @param {string} reason
+ * @returns {boolean} if reason was successfully added to memo.
+ */
+AppRuntime.prototype.disableRuntimeFor = function disableRuntimeFor (reason) {
+  if (typeof reason !== 'string') {
+    throw new TypeError('Expect a string as reason for AppRuntime.prototype.disableRuntimeFor')
+  }
+  if (this.__temporaryDisablingReasons.indexOf(reason) >= 0) {
+    logger.warn(`runtime has already been disabled for reason(${reason}), possible duplicated operation.`)
+    return false
+  }
+  this.__temporaryDisablingReasons.push(reason)
+  logger.warn(`disabling runtime for reason: ${reason}, current reasons: ${this.__temporaryDisablingReasons}`)
+  this.component.turen.toggleWakeUpEngine(false)
+  return true
+}
+
+/**
+ * Remove previously disabling runtime reason. Would enable runtime if there is no reason remaining.
+ *
+ * @param {string} reason
+ * @returns {boolean} if reason was successfully removed from memo.
+ */
+AppRuntime.prototype.enableRuntimeFor = function enableRuntimeFor (reason) {
+  if (typeof reason !== 'string') {
+    throw new TypeError('Expect a string as reason for AppRuntime.prototype.enableRuntimeFor')
+  }
+  var idx = this.__temporaryDisablingReasons.indexOf(reason)
+  if (idx < 0) {
+    return false
+  }
+  this.__temporaryDisablingReasons.splice(idx, 1)
+  logger.warn(`enabling runtime for reason: ${reason}, current reasons: ${this.__temporaryDisablingReasons}`)
+  if (this.__temporaryDisablingReasons.length === 0) {
+    this.component.turen.toggleWakeUpEngine(true)
+  }
+  return true
+}
+
+/**
  * Put device into idle state. Terminates apps in stack (i.e. apps in active and paused).
  *
  * Also clears apps' contexts.
@@ -283,6 +386,7 @@ AppRuntime.prototype.hibernate = function hibernate () {
   }
   logger.info('hibernating runtime')
   this.hibernated = true
+  this.disableRuntimeFor('hibernated')
   this.component.turen.pickup(false)
   this.setMicMute(true, { silent: true })
   /**
@@ -306,6 +410,7 @@ AppRuntime.prototype.wakeup = function wakeup (options) {
   }
   logger.info('waking up runtime')
   this.hibernated = false
+  this.enableRuntimeFor('hibernated')
   if (shouldWelcome) {
     this.shouldWelcome = true
   }
@@ -315,6 +420,7 @@ AppRuntime.prototype.wakeup = function wakeup (options) {
 
   this.component.custodian.resetState()
   this.component.custodian.prepareNetwork()
+  this.component.dispatcher.delegate('runtimeDidResumeFromSleep')
 }
 
 /**
@@ -581,7 +687,9 @@ AppRuntime.prototype.setForegroundById = function setForegroundById (appId, opti
 
 /**
  *
- * @param {boolean} [mute] - set mic to mute, switch mute if not given.
+ * @param {boolean} mute - set mic to mute, switch mute if not given.
+ * @param {object} [options]
+ * @param {boolean} [options.silent]
  */
 AppRuntime.prototype.setMicMute = function setMicMute (mute, options) {
   var silent = _.get(options, 'silent', false)
@@ -591,11 +699,8 @@ AppRuntime.prototype.setMicMute = function setMicMute (mute, options) {
     future = this.component.light.stop('@yoda', 'system://setMuted.js')
   }
 
-  if (mute === this.component.turen.muted) {
-    return future
-  }
   /** mute */
-  var muted = this.component.turen.toggleMute()
+  var muted = this.component.turen.toggleMute(mute)
 
   if (silent) {
     return future
@@ -792,36 +897,27 @@ AppRuntime.prototype.voiceCommand = function (text, options) {
   var isTriggered = _.get(options, 'isTriggered', false)
   var appId = _.get(options, 'appId')
 
-  var skillOption = {
-    device: {
-      linkage: {
-        trigger: isTriggered
-      }
+  var deviceSkillOption = {
+    linkage: {
+      trigger: isTriggered
     }
   }
-  return new Promise((resolve, reject) => {
-    this.component.flora.getNlpResult(text, skillOption, function (err, nlp, action) {
-      if (err) {
-        return reject(err)
+  return this.component.flora.getNlpResult(text, deviceSkillOption)
+    .then((result) => {
+      var nlp = result[0]
+      var action = result[1]
+      var future = Promise.resolve()
+      if (appId) {
+        /**
+         * retreat self-app into background, then promote the upcoming app
+         * to prevent self being destroy in stack preemption.
+         */
+        future = this.component.lifetime.setBackgroundById(appId)
       }
-      logger.info('get nlp result for asr', text, nlp, action)
-      resolve([ nlp, action ])
+      return future.then(() => this.onVoiceCommand(text, nlp, action, {
+        carrierId: isTriggered ? appId : undefined
+      }))
     })
-  }).then((result) => {
-    var nlp = result[0]
-    var action = result[1]
-    var future = Promise.resolve()
-    if (appId) {
-      /**
-       * retreat self-app into background, then promote the upcoming app
-       * to prevent self being destroy in stack preemption.
-       */
-      future = this.component.lifetime.setBackgroundById(appId)
-    }
-    return future.then(() => this.onVoiceCommand(text, nlp, action, {
-      carrierId: isTriggered ? appId : undefined
-    }))
-  })
 }
 
 /**
@@ -829,9 +925,11 @@ AppRuntime.prototype.voiceCommand = function (text, options) {
  * @param {string} appId -
  * @param {object} [options] -
  * @param {boolean} [options.clearContext] - also clears contexts
+ * @param {boolean} [options.ignoreKeptAlive] - ignore contextOptions.keepAlive
  */
 AppRuntime.prototype.exitAppById = function exitAppById (appId, options) {
   var clearContext = _.get(options, 'clearContext', false)
+  var ignoreKeptAlive = _.get(options, 'ignoreKeptAlive', false)
   if (clearContext) {
     if (appId === this.component.appLoader.getAppIdBySkillId(this.domain.scene)) {
       this.updateCloudStack('', 'scene', { isActive: false })
@@ -840,7 +938,7 @@ AppRuntime.prototype.exitAppById = function exitAppById (appId, options) {
       this.updateCloudStack('', 'cut', { isActive: false })
     }
   }
-  return this.component.lifetime.deactivateAppById(appId)
+  return this.component.lifetime.deactivateAppById(appId, { force: ignoreKeptAlive })
 }
 
 /**
@@ -1004,7 +1102,7 @@ AppRuntime.prototype.shutdown = function shutdown () {
  * @private
  */
 AppRuntime.prototype.ttsMethod = function (name, args) {
-  return this.component.flora.call(`yodart.ttsd.${name}`, args, 'ttsd', 100)
+  return this.component.flora.call(`yodart.ttsd.${name}`, args, 'ttsd', 1000)
 }
 
 AppRuntime.prototype.multimediaMethod = function (name, args) {
@@ -1018,13 +1116,6 @@ AppRuntime.prototype.multimediaMethod = function (name, args) {
 /**
  * @private
  */
-AppRuntime.prototype.onGetPropAll = function () {
-  return {}
-}
-
-/**
- * @private
- */
 AppRuntime.prototype.reconnect = function () {
   wifi.resetDns()
   this.dispatchNotification('on-network-connected', [])
@@ -1033,7 +1124,9 @@ AppRuntime.prototype.reconnect = function () {
   if (this.component.custodian.isConfiguringNetwork()) {
     return this.openUrl(`yoda-skill://network/connected`, { preemptive: false })
   }
-  return this.login()
+  if (!this.component.custodian.isNetworkUnavailable()) {
+    return this.login()
+  }
 }
 
 /**
@@ -1058,29 +1151,7 @@ AppRuntime.prototype.login = _.singleton(function login (options) {
     // login -> mqtt
     this.component.custodian.onLogout()
     return this.cloudApi.connect(masterId)
-      .then((config) => {
-        var opts = Object.assign({ uri: env.speechUri }, config)
-        // TODO: move to use cloudapi?
-        require('@yoda/ota/network').cloudgw = this.cloudApi.cloudgw
-        // FIXME: schedule this update later?
-        this.cloudApi.updateBasicInfo().catch((err) => {
-          logger.error('Unexpected error on updating basic info', err.stack)
-        })
-
-        this.component.flora.updateSpeechPrepareOptions(opts)
-
-        // overwrite `onGetPropAll`.
-        this.onGetPropAll = function onGetPropAll () {
-          return Object.assign({}, config)
-        }
-        this.component.wormhole.setClient(this.cloudApi.mqttcli)
-        var customConfig = _.get(config, 'extraInfo.custom_config')
-        if (customConfig && typeof customConfig === 'string') {
-          this.component.customConfig.onLoadCustomConfig(customConfig)
-        }
-        this.onLoggedIn()
-        this.component.dndMode.recheck()
-      }, (err) => {
+      .then(this.onLoggedIn.bind(this), (err) => {
         if (err && err.code === 'BIND_MASTER_REQUIRED') {
           logger.error('bind master is required, just clear the local and enter network')
           this.component.custodian.resetNetwork()
@@ -1091,16 +1162,33 @@ AppRuntime.prototype.login = _.singleton(function login (options) {
   })
 })
 
+AppRuntime.prototype.onGetPropAll = deprecate(
+  function () {
+    return Object.assign({}, this.credential)
+  },
+  'AppRuntime.onGetPropAll is deprecated. Try AppRuntime.getCopyOfCredential instead.'
+)
+
+AppRuntime.prototype.getCopyOfCredential = function () {
+  return Object.assign({}, this.credential)
+}
+
 /**
  * @private
  */
-AppRuntime.prototype.onLoggedIn = function () {
-  this.component.custodian.onLoggedIn()
+AppRuntime.prototype.onLoggedIn = function onLoggedIn (config) {
+  this.credential = _.pick(config, 'masterId', 'deviceId', 'deviceTypeId', 'key', 'secret')
+  this.component.flora.updateSpeechPrepareOptions(Object.assign({ uri: env.speechUri }, config))
+  this.component.flora.post('yodart.vui.logged-in', [JSON.stringify(this.credential)], 1 /** persist message */)
 
-  var enableTtsService = () => {
-    var config = JSON.stringify(this.onGetPropAll())
-    return this.component.flora.post('yodart.vui.logged-in', [config], 1 /** persist message */)
+  this.component.wormhole.setClient(this.cloudApi.mqttcli)
+  var customConfig = _.get(config, 'extraInfo.custom_config')
+  if (customConfig && typeof customConfig === 'string') {
+    this.component.customConfig.onLoadCustomConfig(customConfig)
   }
+
+  this.component.dndMode.recheck()
+  this.component.custodian.onLoggedIn()
 
   var sendReady = () => {
     var ids = Object.keys(this.component.appScheduler.appMap)
@@ -1116,20 +1204,19 @@ AppRuntime.prototype.onLoggedIn = function () {
             return
             /** delegation should break all actions below */
           }
-          this.welcoming = true
+          this.disableRuntimeFor('welcoming')
           logger.info('announcing welcome')
           return this.setMicMute(false, { silent: true })
             .then(() => {
-              this.component.light.appSound('@yoda', 'system://startup0.ogg')
-              return this.component.light.play('@yoda', 'system://setWelcome.js')
+              this.component.light.play('@yoda', 'system://setWelcome.js')
+                .then(() => this.component.light.stop('@yoda', 'system://boot.js'))
+              return this.component.light.appSound('@yoda', 'system://startup0.ogg')
             })
             .then(() => {
-              // not need to play startup music after relogin
-              this.component.light.stop('@yoda', 'system://boot.js')
-              this.welcoming = false
+              this.enableRuntimeFor('welcoming')
             })
             .catch(err => {
-              this.welcoming = false
+              this.enableRuntimeFor('welcoming')
               logger.error('unexpected error on welcoming', err.stack)
             })
         })
@@ -1142,7 +1229,6 @@ AppRuntime.prototype.onLoggedIn = function () {
   }
 
   return Promise.all([
-    enableTtsService(),
     sendReady() /** only send ready to currently alive apps */,
     this.startDaemonApps(),
     this.setStartupFlag(),

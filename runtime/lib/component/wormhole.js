@@ -101,14 +101,18 @@ Wormhole.prototype.handlers = {
    * @member asr
    */
   asr: function (asr) {
-    this.component.flora.getNlpResult(asr, (err, nlp, action) => {
-      if (err) {
-        logger.error('occurrs some error in speechT', err)
-      } else {
-        logger.info('MQTT command: get nlp result for asr', asr, nlp, action)
-        this.runtime.onVoiceCommand(asr, nlp, action)
-      }
-    })
+    this.component.flora.getNlpResult(asr)
+      .then(
+        res => {
+          var nlp = res[0]
+          var action = res[1]
+          logger.info('MQTT command: get nlp result for asr', asr, nlp, action)
+          return this.runtime.onVoiceCommand(asr, nlp, action)
+        },
+        err => {
+          logger.error('occurrs some error in speechT', err)
+        }
+      )
   },
   /**
    * @member cloud_forward
@@ -157,6 +161,23 @@ Wormhole.prototype.handlers = {
    * @member reset_settings
    */
   reset_settings: function (data) {
+    /**
+     * RESET_OK = "0"
+     * RESET_FAILED_NOPOWER = "1"
+     * RESET_FAILED_SYS_LAUNCHING = "2"
+     * RESET_FAILED_SYS_SLEEP = "3"
+     * RESET_FAILED_SYS_OFF = "4"
+     * RESET_FAILED_SYS_UNKNOWN = "-1"
+     */
+    var result = '0'
+    if (this.runtime.hibernated) {
+      result = '3'
+    }
+    this.sendToApp('reset_settings', result)
+    if (result !== '0') {
+      /** No operations should be performed on not ok result */
+      return
+    }
     this.runtime.onResetSettings()
   },
   /**

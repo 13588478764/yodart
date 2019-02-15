@@ -39,6 +39,7 @@ function Turen (runtime) {
    * if next nlp shall be discarded.
    */
   this.pickingUpDiscardNext = false
+  this.appIdOnVoiceComing = null
 
   /**
    * handle of timer to determines if current 'voice coming' session is alone,
@@ -128,6 +129,9 @@ Turen.prototype.handlers = {
     var speechId = msg[1]
     logger.error(`Unexpected speech error(${errCode}) for speech(${speechId}).`)
     return this.handleSpeechError(errCode, speechId)
+  },
+  'rokid.speech.completed': function () {
+    return this.toggleWakeUpEngine(true)
   }
 }
 
@@ -156,15 +160,27 @@ Turen.prototype.deinit = function deinit () {
  * @param {object} data -
  * @private
  */
-Turen.prototype.listenerWrap = function (name, fn) {
+Turen.prototype.listenerWrap = function listenerWrap (name, fn) {
   return (msg, type) => {
-    if (this.muted) {
-      logger.warn('Mic muted, unexpected event from Turen:', name)
-      return
-    }
     logger.debug(`handling turen event "${name}"`)
     return fn.call(this, msg, type)
   }
+}
+
+/**
+ * Determines if subsequent event from turenproc should be handled interactively
+ * @returns {boolean}
+ */
+Turen.prototype.shouldHandleEvent = function shouldHandleEvent () {
+  if (this.muted) {
+    logger.warn('Mic muted, unexpected event from turen')
+    return false
+  }
+  if (this.runtime.hasBeenDisabled()) {
+    logger.warn('runtime disabled, unexpected event from turen')
+    return false
+  }
+  return true
 }
 
 /**
@@ -258,6 +274,9 @@ Turen.prototype.resetPausedOnAwaken = function resetPausedOnAwaken () {
  * @private
  */
 Turen.prototype.handleVoiceComing = function handleVoiceComing (data) {
+  if (!this.shouldHandleEvent()) {
+    return
+  }
   return this.component.dispatcher.delegate('turenDidWakeUp')
     .then(delegation => {
       if (delegation) {
@@ -265,15 +284,18 @@ Turen.prototype.handleVoiceComing = function handleVoiceComing (data) {
       }
       var future = this.setAwaken()
       clearTimeout(this.solitaryVoiceComingTimer)
+      clearTimeout(this.noVoiceInputTimer)
+      this.noVoiceInputTimeout = null
       this.solitaryVoiceComingTimer = setTimeout(() => {
         logger.warn('detected a solitary voice coming, resetting awaken')
         this.pickup(false, { discardNext: false })
 
         if (this.awaken) {
-          return this.announceNetworkLag()
+          return this.handleSpeechError(/** simulated speech network error */999)
         }
       }, this.solitaryVoiceComingTimeout)
 
+      this.appIdOnVoiceComing = this.component.lifetime.getCurrentAppId()
       /**
        * reset picking up discarding state to enable next nlp process
        */
@@ -314,20 +336,14 @@ Turen.prototype.handleAsrEnd = function handleAsrEnd () {
   this.asrState = 'end'
   clearTimeout(this.noVoiceInputTimer)
 
-  var promises = [
-    this.resetAwaken({
-      recover: /** no recovery shall be made on nlp coming */ false
-    })
-  ]
-
   if (this.pickingUpDiscardNext) {
     /**
      * current session of picking up has been manually discarded,
      * no loading state shall be presented.
      */
-    return Promise.all(promises)
+    return Promise.resolve()
   }
-  return Promise.all(promises.concat(this.component.light.play('@yoda', 'system://loading.js')))
+  return this.component.light.play('@yoda', 'system://loading.js')
 }
 
 /**
@@ -380,14 +396,17 @@ Turen.prototype.handleNlpResult = function handleNlpResult (data) {
     return
   }
 
-  var future
-  if (this.awaken) {
-    future = this.resetAwaken({
-      recover: /** no recovery shall be made on nlp coming */ false
+  var future = this.resetAwaken({
+    recover: /** no recovery shall be made on nlp coming */ false
+  })
+
+  if (!this.shouldHandleEvent()) {
+    return future.then(() => {
+      this.component.light.stop('@yoda', 'system://loading.js')
+      this.recoverPausedOnAwaken()
     })
-  } else {
-    future = Promise.resolve()
   }
+
   return future.then(() => this.runtime.onVoiceCommand(data.asr, data.nlp, data.action))
     .then(success => {
       this.component.light.stop('@yoda', 'system://loading.js')
@@ -418,16 +437,17 @@ Turen.prototype.handleMaliciousNlpResult = function handleMaliciousNlpResult () 
      */
     this.pickingUpDiscardNext = false
     logger.warn(`discarding malicious nlp result for pick up discarded.`)
-    return
+    return this.resetAwaken()
   }
-  if (this.awaken) {
-    this.pickup(false)
-    this.resetAwaken({ recover: false })
-  }
+
   if (!this.component.custodian.isPrepared()) {
     logger.warn('Network not connected, recovering players.')
-    return this.recoverPausedOnAwaken()
+    return this.resetAwaken()
   }
+
+  this.resetAwaken({
+    recover: /** no recovery shall be made on opening an app to handle malicious nlp */ false
+  })
 
   /**
    * Reset previously paused media to prevent un-intended recovering
@@ -446,45 +466,54 @@ Turen.prototype.handleMaliciousNlpResult = function handleMaliciousNlpResult () 
  * Handle 'speech error' events, which are emitted on unexpected speech faults.
  */
 Turen.prototype.handleSpeechError = function handleSpeechError (errCode) {
+  logger.debug('handling speech error', errCode)
   if (this.pickingUpDiscardNext) {
     /**
      * current session of picking up has been manually discarded.
      */
     this.pickingUpDiscardNext = false
     logger.warn(`discarding speech error(${errCode}) for pick up discarded.`)
-    return
+    return this.resetAwaken()
   }
-  if (this.awaken) {
-    this.pickup(false)
-    this.resetAwaken({ recover: false })
-  }
+
+  logger.debug('handling speech error', errCode)
   if (!this.component.custodian.isPrepared()) {
     logger.warn('Network not connected or not logged in, recovering players.')
-    return this.recoverPausedOnAwaken()
+    return this.resetAwaken()
   }
 
-  if (errCode >= 100) {
+  logger.debug('handling speech error', errCode)
+  var future = Promise.resolve()
+  if (this.shouldHandleEvent() && errCode >= 100) {
     /** network error */
-    return this.announceNetworkLag()
+    future = this.announceNetworkLag()
   }
 
-  /**
-   * FIXME: Raison d'etre
-   * cut app like alarm/timer shall be deactivated on awaken.
-   * Currently @yoda/system handles speech error in a such quick way, yet for
-   * some reason apps like cloud-app-client could not determines tts/media
-   * status in such a short time(events have to be transferred through
-   * 2/3 ipc).
-   * Thus just closing cut app here works as expected, and shall be fixed
-   * with a invocation queue in translator-ipc.
-   */
-  this.component.lifetime.deactivateCutApp()
+  if (this.appIdOnVoiceComing) {
+    /**
+     * FIXME: Raison d'etre
+     * cut app like alarm/timer shall be deactivated on awaken.
+     * Currently @yoda/system handles speech error in a such quick way, yet for
+     * some reason apps like cloud-app-client could not determine tts/media
+     * status in such a short time(events have to be transferred through
+     * 2-3 ipc).
+     * Thus just closing cut app here works as expected, and shall be fixed
+     * with an invocation queue in translator-ipc.
+     */
+    future = future.then(() =>
+      this.component.lifetime.deactivateCutApp({ appId: this.appIdOnVoiceComing })
+        .catch(err => {
+          logger.error('Unexpected error on deactivating cut app', err.stack)
+        })
+    )
+  }
+
+  return future
     .then(() => {
-      this.recoverPausedOnAwaken()
-      return this.component.light.stop('@yoda', 'system://loading.js')
-    }, err => {
-      this.component.light.stop('@yoda', 'system://loading.js')
-      logger.error('Unexpected error on deactivating cut app', err.stack)
+      return Promise.all([
+        this.resetAwaken(),
+        this.component.light.stop('@yoda', 'system://loading.js')
+      ])
     })
 }
 
@@ -501,11 +530,18 @@ Turen.prototype.pickup = function pickup (isPickup, options) {
    * otherwise reset picking up discarding state to enable next nlp process,
    */
   this.pickingUpDiscardNext = discardNext && !isPickup
+  /**
+   * manually pick up should not close cut app on speech error 8
+   */
+  this.appIdOnVoiceComing = isPickup ? null : this.appIdOnVoiceComing
   this.component.flora.post('rokid.turen.pickup', [ isPickup ? 1 : 0 ])
+  this.toggleWakeUpEngine(!isPickup)
 
   if (!isPickup) {
     clearTimeout(this.solitaryVoiceComingTimer)
     clearTimeout(this.noVoiceInputTimer)
+    this.solitaryVoiceComingTimer = null
+    this.noVoiceInputTimer = null
   }
 }
 
@@ -564,30 +600,16 @@ Turen.prototype.deleteVtWord = function deleteVtWord (activationWord) {
 }
 
 /**
- * Announce possible network lag. Reset awaken/recover paused media on end of announcements.
+ * Announce possible network lag. Doesn't reset awaken/recover paused media on end of announcements.
  */
 Turen.prototype.announceNetworkLag = function announceNetworkLag () {
-  if (this.awaken) {
-    this.resetAwaken({ recover: false })
-  }
+  logger.debug('announcing turen network lag')
   return this.component.light.lightMethod('networkLagSound', [ '/opt/media/network_lag_common.ogg' ])
-    .then(
-      () => {
-        /** stop network lag light effects */
-        this.component.light.lightMethod('stopNetworkLagSound', [])
-        if (this.awaken) {
-          return
-        }
-        return this.recoverPausedOnAwaken()
-      },
-      err => {
-        logger.error('Unexpected error on playing network lag sound', err.stack)
-        /** stop network lag light effects */
-        this.component.light.lightMethod('stopNetworkLagSound', [])
-        if (this.awaken) {
-          return
-        }
-        return this.recoverPausedOnAwaken()
-      }
-    )
+    .catch(err => {
+      logger.error('Unexpected error on playing network lag sound', err.stack)
+    })
+    .then(() => {
+      /** stop network lag light effects */
+      this.component.light.lightMethod('stopNetworkLagSound', [])
+    })
 }

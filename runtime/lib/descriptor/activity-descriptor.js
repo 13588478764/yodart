@@ -278,7 +278,7 @@ Object.assign(ActivityDescriptor.prototype,
       fn: function get () {
         // TODO(Yorkie): check permission.
         logger.warn('activity.get() is deprecated, please use @yoda/property instead.')
-        return Promise.resolve(this._runtime.onGetPropAll())
+        return Promise.resolve(this._runtime.getCopyOfCredential())
       }
     },
     /**
@@ -294,7 +294,7 @@ Object.assign(ActivityDescriptor.prototype,
       type: 'method',
       returns: 'promise',
       fn: function exit (options) {
-        return this._runtime.exitAppById(this._appId, options)
+        return this._runtime.exitAppById(this._appId, Object.assign({}, options, { ignoreKeptAlive: true }))
       }
     },
     /**
