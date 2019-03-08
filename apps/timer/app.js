@@ -15,110 +15,110 @@ module.exports = function (activity) {
   var remainMilliSecs = 0
   var lastStartTimestamp = 0
   var ringtoneTimer = null
+  var isPickup = false
+  var pickupTimer = null
+  var isDestroied = true
 
   activity.on('create', () => {
     logger.log('on create')
-    activity.keyboard.on('click', (event) => {
-      logger.log('on key event: ' + event.keyCode)
-      activity.tts.stop()
-      stopRingtone()
-      if (timer !== null) {
-        activity.setBackground()
-      } else {
-        activity.exit({ clearContext: true })
-      }
-    })
+    activity.keyboard.on('click', (event) => { kbdHandler('click', event) })
+    activity.keyboard.on('dbclick', (event) => { kbdHandler('dbclick', event) })
     activity.keyboard.preventDefaults(config.KEY_CODE.POWER)
+    activity.setContextOptions({ keepAlive: true })
+    isDestroied = false
+  })
+
+  activity.on('active', () => {
+    logger.log('on active')
+    activity.setContextOptions({ keepAlive: true })
   })
 
   activity.on('background', () => {
     logger.log('on background')
-    activity.keyboard.restoreDefaults(config.KEY_CODE.MIKE)
-    activity.keyboard.restoreDefaults(config.KEY_CODE.VOLDOWN)
-    activity.keyboard.restoreDefaults(config.KEY_CODE.VOLUP)
+    shutup()
+    if (!isTimerExist()) {
+      activity.exit({ clearContext: true })
+    }
   })
 
   activity.on('destroy', () => {
     logger.log('on destroy')
-    activity.keyboard.restoreDefaults(config.KEY_CODE.MIKE)
-    activity.keyboard.restoreDefaults(config.KEY_CODE.VOLDOWN)
-    activity.keyboard.restoreDefaults(config.KEY_CODE.VOLUP)
-    activity.keyboard.restoreDefaults(config.KEY_CODE.POWER)
+    activity.keyboard.restoreAll()
+    shutup()
+    activity.setPickup(false)
+    isDestroied = true
   })
 
   activity.on('request', (nlp, action) => {
     logger.log('on request: ', nlp.intent, nlp.slots)
-    stopRingtone()
+    shutup()
     switch (nlp.intent) {
       case 'timer_start':
         totalSecs = parseTimeToSeconds(nlp.slots)
         logger.debug(`count ${totalSecs} seconds`)
         if (totalSecs === 0) {
+          setPickup()
           speak(strings.SET_FAIL.NO_TIME)
         } else if (totalSecs < config.TIME.SHORTEST) {
           speak(strings.SET_FAIL.TOO_SHORT, time.toString(config.TIME.SHORTEST))
         } else if (totalSecs > config.TIME.LONGEST) {
           speak(strings.SET_FAIL.TOO_LONG, time.toString(config.TIME.LONGEST))
         } else {
-          if (timer !== null) {
-            clearTimeout(timer)
+          if (isTimerExist()) {
+            cancelTimer()
           }
-          remainMilliSecs = totalSecs * 1000
-          timer = setTimeout(timeupHandler, remainMilliSecs)
-          lastStartTimestamp = Date.now()
+          setTimer(totalSecs * 1000)
           speak(strings.SET_SUCC, time.toString(totalSecs))
         }
         break
       case 'timer_close':
-        if (timer === null) {
-          speak(strings.CANCEL_FAIL)
-        } else {
-          clearTimeout(timer)
-          timer = null
+        if (isTimerExist()) {
+          cancelTimer()
           speak(strings.CANCEL_SUCC)
+        } else {
+          speak(strings.CANCEL_FAIL)
         }
         break
       case 'timer_pause':
-        if (timer !== null || remainMilliSecs > 0) {
-          clearTimeout(timer)
-          timer = null
-          var elapsed = Date.now() - lastStartTimestamp
-          remainMilliSecs -= elapsed
+        if (isTimerExist()) {
+          pauseTimer()
           speak(strings.PAUSE)
         } else {
           speak(strings.CANCEL_FAIL)
         }
         break
       case 'timer_keepon':
-        logger.debug(`ramain time: ${Math.round(remainMilliSecs / 1000)} secs`)
-        if (timer !== null) {
-          var realRemain = remainMilliSecs - (Date.now() - lastStartTimestamp)
+        var realRemain = resumeTimer()
+        logger.debug(`real ramain time: ${realRemain} ms`)
+        if (realRemain > 0) {
           speak(strings.RESUME, time.toString(Math.ceil(realRemain / 1000)))
-        } else if (remainMilliSecs > 0) {
-          timer = setTimeout(timeupHandler, remainMilliSecs)
-          lastStartTimestamp = Date.now()
-          speak(strings.RESUME, time.toString(Math.ceil(remainMilliSecs / 1000)))
         } else {
           speak(strings.CANCEL_FAIL)
         }
         break
       case 'timer_restart':
-        if (timer === null) {
-          speak(strings.CANCEL_FAIL)
-        } else {
-          clearTimeout(timer)
-          remainMilliSecs = totalSecs * 1000
-          timer = setTimeout(timeupHandler, remainMilliSecs)
-          lastStartTimestamp = Date.now()
+        if (isTimerExist()) {
+          cancelTimer()
+          setTimer(totalSecs * 1000)
           speak(strings.RESTART, time.toString(totalSecs))
+        } else {
+          speak(strings.CANCEL_FAIL)
         }
         break
       case 'howtouse_timer':
+        setPickup()
         speak(strings.USAGE)
         break
       case 'timer_comeback':
-        var deltaTime = remainMilliSecs - (Date.now() - lastStartTimestamp)
-        speak(strings.CHECK, time.toString(Math.ceil(deltaTime / 1000)))
+        if (isTimerExist()) {
+          var deltaTime = remainMilliSecs
+          if (timer !== null) {
+            deltaTime -= (Date.now() - lastStartTimestamp)
+          }
+          speak(strings.CHECK, time.toString(Math.ceil(deltaTime / 1000)))
+        } else {
+          speak(strings.CANCEL_FAIL)
+        }
         break
       default:
         activity.exit({ clearContext: true })
@@ -126,13 +126,136 @@ module.exports = function (activity) {
     }
   })
 
-  function afterSpeak () {
-    logger.debug('default after speak, set background.')
-    activity.setBackground()
+  function kbdHandler (action, event) {
+    logger.log(`on kbd ${action}: ${event.keyCode}`)
+    switch (action) {
+      case 'click':
+      case 'dbclick':
+        shutup()
+        if (isTimerExist()) {
+          activity.setBackground()
+        } else {
+          activity.exit({ clearContext: true })
+        }
+        break
+      default:
+        break
+    }
+  }
+
+  function pauseTimer () {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+      var elapsed = Date.now() - lastStartTimestamp
+      remainMilliSecs -= elapsed
+    }
+  }
+
+  function resumeTimer () {
+    if (timer !== null) {
+      var realRemain = remainMilliSecs - (Date.now() - lastStartTimestamp)
+      return realRemain
+    } else if (remainMilliSecs > 0) {
+      timer = setTimeout(timeupHandler, remainMilliSecs)
+      lastStartTimestamp = Date.now()
+      return remainMilliSecs
+    } else {
+      return 0
+    }
+  }
+
+  function cancelTimer () {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+    remainMilliSecs = 0
+  }
+
+  function setTimer (ms) {
+    remainMilliSecs = ms
+    timer = setTimeout(timeupHandler, remainMilliSecs)
+    lastStartTimestamp = Date.now()
+  }
+
+  function isTimerExist () {
+    return timer !== null || remainMilliSecs > 0
+  }
+
+  function defaultNextAction () {
+    if (isDestroied) {
+      logger.warn('Destroied early...')
+      return activity.exit({ clearContext: true })
+    }
+    if (isPickup) {
+      logger.info('In pickup mode, listening...')
+      return
+    }
+    if (isTimerExist()) {
+      logger.debug('Timer running, set background.')
+      activity.setBackground()
+    } else {
+      logger.log('Timer cancelled, exit now.')
+      activity.exit({ clearContext: true })
+    }
+  }
+
+  var nextActionFunc = null
+  var nextActionId = 0
+  function registerNextAction (fn) {
+    if (typeof fn === 'function' && fn !== defaultNextAction) {
+      nextActionFunc = fn
+      logger.debug('register private fn')
+    } else {
+      nextActionFunc = defaultNextAction
+      logger.debug('register default fn')
+    }
+    nextActionId = Date.now()
+    return nextActionId
+  }
+
+  function triggerNextAction (id, fn) {
+    logger.debug(`queueId=${nextActionId}, triggerId=${id}`)
+    if (nextActionId !== id) {
+      logger.info('action updated.')
+      return
+    }
+    if (typeof fn === 'function') {
+      nextActionFunc = fn
+    }
+    process.nextTick(nextActionFunc)
+  }
+
+  function setPickup () {
+    if (!isPickup) {
+      var id = registerNextAction()
+      activity.setPickup(true, 999999)
+        .then(() => {
+          logger.debug('setPickup OK.')
+          isPickup = true
+          if (pickupTimer != null) {
+            clearTimeout(pickupTimer)
+          }
+          pickupTimer = setTimeout(() => {
+            isPickup = false
+            triggerNextAction(id)
+          }, config.TIME.PICKUP)
+        })
+        .catch((err) => {
+          logger.error('setPickup failed:', err)
+          triggerNextAction(id)
+        })
+    }
+  }
+
+  function afterSpeakCallback (id) {
+    logger.debug('Before trigger next action.')
+    triggerNextAction(id)
   }
 
   function speak (text, args) {
-    var afterFunc = afterSpeak
+    var regFunc = defaultNextAction
     if (Array.isArray(text)) {
       var i = math.randInt(text.length)
       text = text[i]
@@ -140,16 +263,24 @@ module.exports = function (activity) {
     if (typeof args === 'string') {
       text = util.format(text, args)
     } else if (typeof args === 'function') {
-      afterFunc = args
+      regFunc = args
     }
+    var id = registerNextAction(regFunc)
     sendCardToApp('ROKID.TIMER', {text: text})
-    activity.tts.stop()
+    activity.tts.stop().catch((err) => { logger.warn('stop tts err:', err) })
     return activity.setForeground().then(() => {
       return activity.tts.speak(text, { impatient: false }).catch((err) => {
         logger.error('Speak error: ', err)
-        afterFunc()
+        afterSpeakCallback(id)
       })
-    }).then(afterFunc)
+    }).then(() => { afterSpeakCallback(id) })
+  }
+
+  function shutup () {
+    activity.tts.stop().catch((err) => {
+      logger.warn('stop tts err:', err)
+    })
+    stopRingtone()
   }
 
   function parseTimeToSeconds (slots) {
@@ -180,7 +311,10 @@ module.exports = function (activity) {
     logger.log('timer is up')
     timer = null
     remainMilliSecs = 0
-    speak(strings.TIMEUP, () => playRingtone(config.RINGTONE.RING_TIMES))
+    speak(strings.TIMEUP, () => {
+      logger.debug('before trigger play ringtone')
+      playRingtone(config.RINGTONE.RING_TIMES)
+    })
     trace([{
       event: 'timer',
       action: 'triggered'
@@ -202,9 +336,11 @@ module.exports = function (activity) {
     logger.log(`playRingtone, count=${count}`)
     activity.setForeground().then(() => {
       activity.media.setLoopMode(true)
-      activity.media.start(config.RINGTONE.URL, { streamType: 'alarm' })
+      activity.media.start(config.RINGTONE.URL, { streamType: 'alarm' }).catch((err) => {
+        logger.warn('play ringtone error:', err)
+      })
       ringtoneTimer = setTimeout(() => {
-        activity.media.stop()
+        activity.media.stop().catch((err) => { logger.warn('stop ringtone error:', err) })
         if (count - 1 > 0) {
           ringtoneTimer = setTimeout(() => {
             playRingtone(count - 1)
@@ -213,6 +349,8 @@ module.exports = function (activity) {
           activity.exit({ clearContext: true })
         }
       }, config.RINGTONE.RING_SECONDS * 1000)
+    }).catch((err) => {
+      logger.warn('play ringtone failed:', err)
     })
   }
 
@@ -221,6 +359,8 @@ module.exports = function (activity) {
       clearTimeout(ringtoneTimer)
       ringtoneTimer = null
     }
-    activity.media.stop()
+    activity.media.stop().catch((err) => {
+      logger.warn('stop ringtone error:', err)
+    })
   }
 }

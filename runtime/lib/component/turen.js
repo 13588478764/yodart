@@ -2,9 +2,10 @@ var logger = require('logger')('turen')
 
 var _ = require('@yoda/util')._
 var bluetooth = require('@yoda/bluetooth')
+var manifest = require('@yoda/manifest')
 
-var VT_WORDS_ADD_WORD_CHANNEL = 'rokid.turen.addVtWord'
-var VT_WORDS_DEL_WORD_CHANNEL = 'rokid.turen.removeVtWord'
+var VT_WORDS_SET_WORD_CHANNEL = 'rokid.turen.vtwords'
+var Caps = require('@yoda/caps/caps.node').Caps
 
 module.exports = Turen
 function Turen (runtime) {
@@ -45,18 +46,34 @@ function Turen (runtime) {
    * handle of timer to determines if current 'voice coming' session is alone,
    * no upcoming asr pending/end is sent in company with it.
    */
-  this.solitaryVoiceComingTimeout = process.env.YODA_SOLITARY_VOICE_COMING_TIMEOUT || 9000
   this.solitaryVoiceComingTimer = null
   /**
    * handle of timer to determines if current awaken session is no voice input available so far,
    * no upcoming asr pending would be sent any way.
    */
-  this.noVoiceInputTimeout = process.env.YODA_NO_VOICE_INPUT_TIMEOUT || 6000
   this.noVoiceInputTimer = null
   /**
    * last wakeup degree
    */
   this.degree = 0
+}
+
+/**
+ * @type {number}
+ */
+Turen.solitaryVoiceComingTimeout = manifest.getDefaultValue('turen.solitary_voice_coming_timeout') || 9000
+
+/**
+ * @type {number}
+ */
+Turen.noVoiceInputTimeout = manifest.getDefaultValue('turen.no_voice_input_timeout') || 6000
+
+/**
+ * @private
+ * Determines if the errno returned from speech service was a network related error.
+ */
+Turen.isSpeechNetworkError = function isSpeechNetworkError (errno) {
+  return errno >= 100 || errno === 6
 }
 
 Turen.prototype.handlers = {
@@ -285,7 +302,7 @@ Turen.prototype.handleVoiceComing = function handleVoiceComing (data) {
       var future = this.setAwaken()
       clearTimeout(this.solitaryVoiceComingTimer)
       clearTimeout(this.noVoiceInputTimer)
-      this.noVoiceInputTimeout = null
+      this.noVoiceInputTimer = null
       this.solitaryVoiceComingTimer = setTimeout(() => {
         logger.warn('detected a solitary voice coming, resetting awaken')
         this.pickup(false, { discardNext: false })
@@ -293,7 +310,7 @@ Turen.prototype.handleVoiceComing = function handleVoiceComing (data) {
         if (this.awaken) {
           return this.handleSpeechError(/** simulated speech network error */999)
         }
-      }, this.solitaryVoiceComingTimeout)
+      }, Turen.solitaryVoiceComingTimeout)
 
       this.appIdOnVoiceComing = this.component.lifetime.getCurrentAppId()
       /**
@@ -325,7 +342,7 @@ Turen.prototype.handleAsrProgress = function handleAsrProgress (state) {
   this.noVoiceInputTimer = setTimeout(() => {
     logger.warn('no more voice input detected, closing pickup')
     this.pickup(false, { discardNext: false })
-  }, this.noVoiceInputTimeout)
+  }, Turen.noVoiceInputTimeout)
 }
 
 /**
@@ -407,7 +424,8 @@ Turen.prototype.handleNlpResult = function handleNlpResult (data) {
     })
   }
 
-  return future.then(() => this.runtime.onVoiceCommand(data.asr, data.nlp, data.action))
+  return future
+    .then(() => this.runtime.handleNlpIntent(data.asr, data.nlp, data.action, { source: 'voice' }))
     .then(success => {
       this.component.light.stop('@yoda', 'system://loading.js')
       if (success) {
@@ -424,6 +442,7 @@ Turen.prototype.handleNlpResult = function handleNlpResult (data) {
     }, err => {
       this.component.light.stop('@yoda', 'system://loading.js')
       logger.error('Unexpected error on open handling nlp', err.stack)
+      this.recoverPausedOnAwaken()
     })
 }
 
@@ -484,7 +503,7 @@ Turen.prototype.handleSpeechError = function handleSpeechError (errCode) {
 
   logger.debug('handling speech error', errCode)
   var future = Promise.resolve()
-  if (this.shouldHandleEvent() && errCode >= 100) {
+  if (this.shouldHandleEvent() && Turen.isSpeechNetworkError(errCode)) {
     /** network error */
     future = this.announceNetworkLag()
   }
@@ -579,24 +598,22 @@ Turen.prototype.toggleMute = function toggleMute (mute) {
 }
 
 /**
- * Add an activation word.
- * @param {string} activationTxt
- * @param {string} activationPy
+ * set all activation words.
+ * @param {array<object>} vtWords
  */
-Turen.prototype.addVtWord = function addVtWord (activationWord, activationPy) {
-  this.component.flora.post(VT_WORDS_ADD_WORD_CHANNEL, [
-    activationWord,
-    activationPy,
-    1
-  ])
-}
-
-/**
- * Delete an activation word
- * @param {string} activationTxt
- */
-Turen.prototype.deleteVtWord = function deleteVtWord (activationWord) {
-  this.component.flora.post(VT_WORDS_DEL_WORD_CHANNEL, [ activationWord ])
+Turen.prototype.setVtWords = function setVtWords (vtWords) {
+  var msg = new Caps()
+  vtWords.forEach((vtWord) => {
+    var vtWordCaps = new Caps()
+    vtWordCaps.writeString(vtWord.txt)
+    vtWordCaps.writeString(vtWord.py)
+    vtWordCaps.writeInt32(1) // type of awake
+    vtWordCaps.writeFloat(vtWord.margin_index) // sensibility of awake
+    vtWordCaps.writeInt32(vtWord.cloud_confirm)
+    msg.writeCaps(vtWordCaps)
+  })
+  this.component.flora.post(VT_WORDS_SET_WORD_CHANNEL, msg, 1)
+  return Promise.resolve()
 }
 
 /**
